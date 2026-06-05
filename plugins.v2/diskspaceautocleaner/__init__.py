@@ -12,9 +12,9 @@ from app.schemas import NotificationType
 
 class DiskSpaceAutoCleaner(_PluginBase):
     plugin_name = "硬盘空间自动清理"
-    plugin_desc = "监控指定硬盘/媒体库剩余空间，在空间不足时按路径映射扫描对应媒体库并生成清理建议。v1.3 默认只报告，不删除任何文件。"
+    plugin_desc = "监控指定硬盘/媒体库剩余空间，在空间不足时按路径映射扫描对应媒体库并生成清理建议。v1.8 添加每次删除最大空间限制，避免一次性删除过多。"
     plugin_icon = "harddisk.png"
-    plugin_version = "1.3"
+    plugin_version = "1.8"
     plugin_author = "老公"
     author_url = ""
     plugin_config_prefix = "diskspaceautocleaner_"
@@ -33,6 +33,7 @@ class DiskSpaceAutoCleaner(_PluginBase):
     _max_scan_items = 5000
     _candidate_depth = 2
     _recent_days_protect = 30
+    _max_delete_gb = 1000  # 每次删除的最大空间限制（GB）
     _protect_dirs = ""
     _protect_keywords = ""
     _history_limit = 50
@@ -57,6 +58,7 @@ class DiskSpaceAutoCleaner(_PluginBase):
             self._max_scan_items = int(config.get("max_scan_items") or 5000)
             self._candidate_depth = int(config.get("candidate_depth") or 2)
             self._recent_days_protect = int(config.get("recent_days_protect") or 30)
+            self._max_delete_gb = int(config.get("max_delete_gb") or 1000)
             self._protect_dirs = config.get("protect_dirs") or ""
             self._protect_keywords = config.get("protect_keywords") or ""
             self._history_limit = int(config.get("history_limit") or 50)
@@ -187,6 +189,11 @@ class DiskSpaceAutoCleaner(_PluginBase):
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
+                                "content": [{"component": "VTextField", "props": {"model": "max_delete_gb", "label": "每次删除最大空间GB", "type": "number", "placeholder": "1000", "hint": "单次清理时最多删除的空间限制，避免一次性删除过多。0 表示不限制"}}]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
                                 "content": [{"component": "VTextField", "props": {"model": "history_limit", "label": "历史记录保留条数", "type": "number", "placeholder": "50"}}]
                             },
                             {
@@ -221,6 +228,7 @@ class DiskSpaceAutoCleaner(_PluginBase):
             "protect_dirs": "",
             "protect_keywords": "",
             "history_limit": 50,
+            "max_delete_gb": 1000,
             "history": [],
             "sources": "immediate",
         }
@@ -443,13 +451,26 @@ class DiskSpaceAutoCleaner(_PluginBase):
     def _select_candidates(self, candidates: List[Dict[str, Any]], needed_gb: float) -> List[Dict[str, Any]]:
         selected = []
         total = 0.0
+        max_delete_gb = float(self._max_delete_gb or 1000)
+        
         for item in candidates:
+            # 检查候选数量限制
             if len(selected) >= self._max_candidates:
                 break
-            selected.append(item)
-            total += float(item.get("size_gb") or 0)
+            
+            # 检查已达到目标空间
             if needed_gb > 0 and total >= needed_gb:
                 break
+            
+            # 检查单次删除最大空间限制
+            item_size_gb = float(item.get("size_gb") or 0)
+            if total + item_size_gb > max_delete_gb:
+                logger.info(f"达到单次删除最大空间限制 {max_delete_gb}GB，停止添加候选项")
+                break
+            
+            selected.append(item)
+            total += item_size_gb
+        
         return selected
 
     def _notify_report(self, monitor_path: Path, free_gb: float, total_gb: float, free_percent: float,
@@ -458,24 +479,95 @@ class DiskSpaceAutoCleaner(_PluginBase):
         if not self._notify:
             return
         reclaim_gb = sum(float(x.get("size_gb") or 0) for x in selected)
-        lines = [
-            "硬盘空间自动清理：空间不足提醒",
-            f"监控路径：{monitor_path}",
-            f"剩余空间：{free_gb:.1f}GB / {total_gb:.1f}GB ({free_percent:.1f}%)",
-            f"实际扫描：{', '.join(scan_paths or []) or '未匹配到扫描路径'}",
-            f"目标还需释放：{needed_gb:.1f}GB",
-            f"建议候选：{len(selected)} 个，预计可释放 {reclaim_gb:.1f}GB",
-            f"诊断：{self._diagnosis_text(diagnosis)}",
-            "当前为 v1.3 安全报告模式：未删除任何文件。",
-        ]
-        if selected:
-            lines.append("建议清理样例：")
-            for item in selected[:10]:
-                lines.append(f"- {item.get('name')} | {item.get('size_gb'):.1f}GB | {item.get('age_days')}天未修改 | {item.get('path')}")
+        
+        if not selected:
+            # 没有候选删除项，发送空间不足但无候选的通知
+            lines = [
+                "📊 硬盘空间自动清理：空间不足",
+                "",
+                f"剩余空间：{free_gb:.1f}GB / {total_gb:.1f}GB ({free_percent:.1f}%)",
+                f"目标还需释放：{needed_gb:.1f}GB",
+                "",
+                "⚠️ 未找到符合条件的删除候选",
+                "",
+                "💡 当前为安全报告模式：未删除任何文件。"
+            ]
+        else:
+            # 有候选删除项，发送简洁的删除建议通知
+            lines = ["📊 硬盘空间自动清理：删除建议"]
+            
+            # 按类型分组候选项
+            grouped = self._group_candidates(selected)
+            
+            # 只显示删除的媒体名称和总空间
+            for category_type, category_info in grouped.items():
+                icon = category_info.get("icon", "📁")
+                type_name = category_info.get("name", category_type)
+                count = category_info.get("count", 0)
+                total_size_gb = category_info.get("total_size_gb", 0)
+                items = category_info.get("items", [])
+                
+                if count > 0:
+                    lines.append(f"")
+                    lines.append(f"{icon} {type_name}（{count}部，共{total_size_gb:.1f}GB）：")
+                    for item in items:
+                        name = item.get("name", "未知")
+                        size_gb = item.get("size_gb", 0)
+                        lines.append(f"  • {name} - {size_gb:.1f}GB")
+            
+            lines.append("")
+            lines.append(f"💰 预计释放总空间：{reclaim_gb:.1f}GB")
+            lines.append("")
+            lines.append("💡 当前为安全报告模式：未删除任何文件。")
+        
         try:
-            self.post_message(mtype=NotificationType.Plugin, title="硬盘空间自动清理：空间不足", text="\n".join(lines))
+            self.post_message(mtype=NotificationType.Plugin, title="硬盘空间自动清理", text="\n".join(lines))
         except Exception as e:
             logger.warning(f"发送硬盘空间自动清理通知失败：{e}")
+
+    def _group_candidates(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """将候选项按类型分组（电影、电视剧、其他）。使用智能识别判断类型。"""
+        grouped = {
+            "电影": {"icon": "🎬", "name": "电影", "count": 0, "total_size_gb": 0, "items": []},
+            "电视剧": {"icon": "📺", "name": "电视剧", "count": 0, "total_size_gb": 0, "items": []},
+            "其他": {"icon": "📁", "name": "其他", "count": 0, "total_size_gb": 0, "items": []},
+        }
+        
+        for item in candidates:
+            path_str = item.get("path", "")
+            name = item.get("name", "")
+            size_gb = float(item.get("size_gb") or 0)
+            
+            # 判断类型：优先使用智能识别
+            item_type = "其他"
+            
+            # 方法1：智能识别（根据目录结构）
+            if path_str:
+                path_obj = Path(path_str)
+                if self._is_series_folder(path_obj):
+                    item_type = "电视剧"
+                elif path_obj.is_dir():
+                    # 检查路径关键词
+                    path_lower = path_str.lower()
+                    if any(k in path_lower for k in ["/电影/", "/movie/", "/movies/"]):
+                        item_type = "电影"
+                    elif any(k in path_lower for k in ["/电视剧/", "/电视/", "/tv/", "/series/", "/drama/"]):
+                        item_type = "电视剧"
+                elif path_obj.is_file():
+                    # 文件按父目录判断
+                    parent_lower = str(path_obj.parent).lower()
+                    if any(k in parent_lower for k in ["/电影/", "/movie/", "/movies/"]):
+                        item_type = "电影"
+                    elif any(k in parent_lower for k in ["/电视剧/", "/电视/", "/tv/", "/series/", "/drama/"]):
+                        item_type = "电视剧"
+            
+            grouped[item_type]["count"] += 1
+            grouped[item_type]["total_size_gb"] += size_gb
+            grouped[item_type]["items"].append(item)
+        
+        # 移除空的分类
+        result = {k: v for k, v in grouped.items() if v["count"] > 0}
+        return result
 
     def _save_record(self, monitor_path: Path, free_gb: float, total_gb: float, free_percent: float,
                      selected: List[Dict[str, Any]], summary: str, scan_paths: Optional[List[str]] = None,
@@ -531,6 +623,7 @@ class DiskSpaceAutoCleaner(_PluginBase):
                 "max_candidates": self._max_candidates,
                 "max_scan_items": self._max_scan_items,
                 "candidate_depth": self._candidate_depth,
+                "max_delete_gb": self._max_delete_gb,
                 "recent_days_protect": self._recent_days_protect,
                 "protect_dirs": self._protect_dirs,
                 "protect_keywords": self._protect_keywords,
@@ -593,22 +686,97 @@ class DiskSpaceAutoCleaner(_PluginBase):
         return False
 
 
-    def _iter_candidate_items(self, root: Path, depth: int):
-        """按候选深度产出候选项。depth=2 可识别 /link5/电影/电影A。"""
-        depth = max(1, int(depth or 1))
+    def _is_series_folder(self, path: Path) -> bool:
+        """判断是否为电视剧目录（检查是否有 Season/S 目录）。"""
+        try:
+            if not path.is_dir():
+                return False
+            for child in path.iterdir():
+                if child.is_dir():
+                    name = child.name.lower()
+                    # 识别 Season/S/S01/Season 01 等模式
+                    if (name.startswith("season") or 
+                        (name.startswith("s") and len(name) > 1 and name[1:].isdigit()) or
+                        "season" in name):
+                        return True
+        except Exception:
+            pass
+        return False
 
-        def walk(current: Path, level: int):
+    def _detect_root_type(self, path: Path) -> str:
+        """检测根目录类型（电视剧/电影/其他）。"""
+        path_str = path.as_posix().lower()
+        
+        # 电视剧关键词
+        tv_keywords = ["/电视剧/", "/电视/", "/tv/", "/series/", "/drama/"]
+        for keyword in tv_keywords:
+            if keyword in path_str:
+                return "电视剧"
+        
+        # 电影关键词
+        movie_keywords = ["/电影/", "/movie/", "/movies/"]
+        for keyword in movie_keywords:
+            if keyword in path_str:
+                return "电影"
+        
+        return "其他"
+
+    def _iter_candidate_items(self, root: Path, depth: int):
+        """智能扫描候选：
+        - 电视剧根目录：只扫描第一级子目录（剧集名），避免删除单季导致缺集
+        - 混放根目录：智能识别电视剧，只返回剧集根目录，不扫描季目录
+        - 电影根目录：按配置深度扫描
+        """
+        depth = max(1, int(depth or 1))
+        root_type = self._detect_root_type(root)
+        
+        # 电视剧根目录：只扫描第一级子目录（剧集名）
+        if root_type == "电视剧":
+            try:
+                for child in root.iterdir():
+                    if child.is_dir():
+                        yield child
+            except Exception as e:
+                logger.debug(f"扫描电视剧根目录失败 {root}: {e}")
+            return
+        
+        # 混放根目录（类型A）：智能识别电视剧目录
+        def walk_mixed(current: Path, current_level: int):
+            try:
+                children = list(current.iterdir())
+            except Exception:
+                return
+            
+            for child in children:
+                # 如果是电视剧目录，只返回根目录
+                if child.is_dir() and self._is_series_folder(child):
+                    yield child
+                    continue
+                
+                # 其他目录/文件按深度扫描
+                if current_level >= depth or child.is_file():
+                    yield child
+                elif child.is_dir():
+                    yield from walk_mixed(child, current_level + 1)
+        
+        # 电影和其他根目录：按配置深度扫描
+        def walk_normal(current: Path, current_level: int):
             try:
                 children = list(current.iterdir())
             except Exception:
                 return
             for child in children:
-                if level >= depth or child.is_file():
+                if current_level >= depth or child.is_file():
                     yield child
                 elif child.is_dir():
-                    yield from walk(child, level + 1)
-
-        yield from walk(root, 1)
+                    yield from walk_normal(child, current_level + 1)
+        
+        if root_type == "其他":
+            # 混放路径，使用智能扫描
+            yield from walk_mixed(root, 1)
+        else:
+            # 电影路径，使用正常扫描
+            yield from walk_normal(root, 1)
 
     @staticmethod
     def _diagnosis_text(diagnosis: Optional[Dict[str, Any]]) -> str:
